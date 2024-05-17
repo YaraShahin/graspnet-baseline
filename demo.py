@@ -53,12 +53,13 @@ def get_and_process_data(data_dir):
     color = np.array(Image.open(os.path.join(data_dir, 'color.png')), dtype=np.float32) / 255.0
     depth = np.array(Image.open(os.path.join(data_dir, 'depth.png')))
     workspace_mask = np.array(Image.open(os.path.join(data_dir, 'workspace_mask.png')))
-    meta = scio.loadmat(os.path.join(data_dir, 'meta.mat'))
-    intrinsic = meta['intrinsic_matrix']
-    factor_depth = meta['factor_depth']
+    #meta = scio.loadmat(os.path.join(data_dir, 'meta.mat'))
+    #intrinsic = meta['intrinsic_matrix']
+    fx, fy, cx, cy = 911.95, 912.27, 651.08, 347.59
+    factor_depth = 1000
 
     # generate cloud
-    camera = CameraInfo(1280.0, 720.0, intrinsic[0][0], intrinsic[1][1], intrinsic[0][2], intrinsic[1][2], factor_depth)
+    camera = CameraInfo(1280.0, 720.0, fx, fy, cx, cy, factor_depth)
     cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
 
     # get valid points
@@ -73,8 +74,8 @@ def get_and_process_data(data_dir):
         idxs1 = np.arange(len(cloud_masked))
         idxs2 = np.random.choice(len(cloud_masked), cfgs.num_point-len(cloud_masked), replace=True)
         idxs = np.concatenate([idxs1, idxs2], axis=0)
-    cloud_sampled = cloud_masked[idxs]
-    color_sampled = color_masked[idxs]
+    cloud_sampled = cloud_masked
+    color_sampled = color_masked
 
     # convert data
     cloud = o3d.geometry.PointCloud()
