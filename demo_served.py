@@ -8,7 +8,7 @@ import scipy.io as scio
 from PIL import Image
 import time
 import copy
-
+from skimage.io import imread
 import torch
 from graspnetAPI import GraspGroup
 
@@ -29,8 +29,10 @@ num_view = 300
 COLOR_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/color.png"
 DEPTH_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/depth.png"
 WORKSPACE_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/workspace_mask.png"
+HAND_SEG_PATH = r"/home/yara/camera_ws/src/EgoHOS/testimages/pred_twohands/color.png"
 
 OUTPUT_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/transformation_matrix.npy"
+HAND_OUTPUT_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/hand_transformation_matrix.npy"
 WIDTH_PATH = r"/home/yara/camera_ws/src/graspnet-baseline/doc/example_data/width.txt"
 
 print("[GRASPNET] Initializing Model")
@@ -43,6 +45,34 @@ device = torch.device("cuda:0")
 checkpoint = torch.load(CHECKPOINT_PATH)
 
 print("[GRASPNET] Done; Time:", time.time() -  curr_time)
+
+def get_point_translation_matrix(centroid_x, centroid_y):
+    fx, fy, cx, cy = 911.95, 912.27, 651.08, 347.59
+    depth_img = np.array(Image.open(DEPTH_PATH))
+    Z = depth_img[centroid_y, centroid_x]
+    X = (centroid_x - cx) * Z / fx
+    Y = (centroid_y - cy) * Z / fy
+    return (X, Y, Z)
+
+def get_centroid(img_path):
+    image = imread(img_path)
+    #print(image)
+    # Convert the image to a NumPy array
+    image_array = np.array(image)
+    #print(image_array)
+    
+    # Find the coordinates of all white pixels (value 2)
+    white_pixels = np.argwhere(image_array == 2)
+    #print(white_pixels)
+    
+    # Calculate the mean of the x and y coordinates
+    try:
+        centroid_y, centroid_x = np.mean(white_pixels, axis=0)
+    except:
+        centroid_y, centroid_x = 0, 0
+        print("[GRASPNET] ERROR: HAND Centroid FAILED!")
+    
+    return int(centroid_x), int(centroid_y)
     
 def get_net():
     net_instance = copy.deepcopy(net)
@@ -103,6 +133,7 @@ def get_grasps(net, end_points):
     gg.sort_by_score()
     the_grasp = None
     current_depth = 70
+    the_i = 0
 
     for i in range(0, 20):
         """if (gg[i].translation[2] < 0.5):
@@ -112,13 +143,16 @@ def get_grasps(net, end_points):
         if (gg[i].translation[2] < current_depth):
             the_grasp = gg[i]
             current_depth = gg[i].translation[2]
+            the_i = i
 
+    gg[the_i].score = 100000
+    gg.sort_by_score()
     if ((not the_grasp) or (the_grasp.translation[2] > 0.5)):
         return 0, 0    
     
     return gg, the_grasp
 
-def combine_translation_rotation(translation, rotation):
+def combine_translation_rotation(translation, rotation = np.zeros((3,3))):
     # Ensure translation is a column vector
     translation = np.array(translation).reshape(3, 1)
     
@@ -134,7 +168,7 @@ def combine_translation_rotation(translation, rotation):
     return transformation_matrix
 
 def vis_grasps(gg, cloud):
-    gg = gg[:20]
+    gg = gg[:2]
     grippers = gg.to_open3d_geometry_list()
     o3d.visualization.draw_geometries([cloud, *grippers])
 
@@ -156,7 +190,17 @@ def demo():
     print("4x4 rotation matrix:\n", rot_mat)
     print("width:", the_grasp.width, "\n")
 
+    print("============= HAND POSE RESULTS ==============")
+    hand_centroid_x, hand_centroid_y = 0,0
+    #hand_centroid_x, hand_centroid_y = get_centroid(HAND_SEG_PATH) 
+    print("hii")
+    hand_translation = get_point_translation_matrix(hand_centroid_x, hand_centroid_y)
+    print("hii2")
+    hand_rot_mat = combine_translation_rotation(hand_translation)
+    print("4x4 rotation matrix:\n", hand_rot_mat)
+
     np.save(OUTPUT_PATH, rot_mat)
+    np.save(HAND_OUTPUT_PATH, hand_rot_mat)
 
     with open(WIDTH_PATH, 'w') as file:
         file.write(str(the_grasp.width))
@@ -167,16 +211,20 @@ def demo():
 if __name__=='__main__':
     try:
         while True:
-            if (os.path.exists(COLOR_PATH) and os.path.exists(DEPTH_PATH) and os.path.exists(WORKSPACE_PATH)):
+            if (os.path.exists(COLOR_PATH) and os.path.exists(DEPTH_PATH) and os.path.exists(WORKSPACE_PATH) and os.path.exists(HAND_SEG_PATH)):
                 curr_time = time.time()
                 print("[GRASPNET] Generating Grasp Pose...")
                 demo()
+                print("[GRASPNET] Generation done; Cleaning ws...")
                 os.remove(COLOR_PATH)
                 os.remove(DEPTH_PATH)
                 os.remove(WORKSPACE_PATH)
+                os.remove(HAND_SEG_PATH)
                 print("[GRASPNET] Finally Done; Time:", time.time() -  curr_time)
             else:
                 time.sleep(2)
-    except:
-        print("error in graspnet")
+                ##print(os.path.exists(COLOR_PATH) and os.path.exists(DEPTH_PATH) and os.path.exists(WORKSPACE_PATH))
+                #print(os.path.exists(HAND_SEG_PATH))
+    except Exception as e:
+        print("error in graspnet", e)
 

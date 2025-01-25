@@ -108,7 +108,7 @@ def collision_detection(gg, cloud):
 def vis_grasps(gg, cloud):
     gg.nms()
     gg.sort_by_score()
-    gg = gg[:50]
+    gg = gg[:20]
     grippers = gg.to_open3d_geometry_list()
     o3d.visualization.draw_geometries([cloud, *grippers])
 
