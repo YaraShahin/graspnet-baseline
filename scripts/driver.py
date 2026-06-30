@@ -68,9 +68,11 @@ class GraspNetNode(Node):
         self.declare_parameter('voxel_size', 0.01)
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('max_grasps', 50)
+        self.declare_parameter('min_score', 0.2)
         # realsense aligned-depth is 16UC1 millimetres; this converts raw depth to metres
         self.declare_parameter('depth_scale', 1000.0)
         self.declare_parameter('sync_slop', 0.05)
+        self.declare_parameter('save_debug_inputs_dir', '/tmp/graspnet_inputs')
 
         device_name = self.get_parameter('device').value
         self._device = torch.device(device_name if torch.cuda.is_available() else 'cpu')
@@ -78,6 +80,7 @@ class GraspNetNode(Node):
         self._voxel_size = self.get_parameter('voxel_size').value
         self._collision_thresh = self.get_parameter('collision_thresh').value
         self._max_grasps = self.get_parameter('max_grasps').value
+        self._min_score = self.get_parameter('min_score').value
         self._depth_scale = self.get_parameter('depth_scale').value
         self._publish_debug_image = self.get_parameter('publish_debug_image').value
         self._debug_approach_length = self.get_parameter('debug_approach_length').value
@@ -112,7 +115,7 @@ class GraspNetNode(Node):
         info_sub = message_filters.Subscriber(
             self, CameraInfo, self.get_parameter('camera_info_topic').value, qos_profile=sensor_qos)
         self._sync = message_filters.ApproximateTimeSynchronizer(
-            [mask_sub, depth_sub, info_sub], queue_size=5,
+            [mask_sub, depth_sub, info_sub], queue_size=30,
             slop=self.get_parameter('sync_slop').value)
         self._sync.registerCallback(self._on_synced)
 
@@ -141,7 +144,11 @@ class GraspNetNode(Node):
         self._busy = True
         self._trigger_pending = False
         try:
-            self._process(mask_msg, depth_msg, info_msg)
+            success = self._process(mask_msg, depth_msg, info_msg)
+            # If inference found no valid grasps (e.g. bad depth, collisions, or missing segmentation)
+            # but the hand is still stable, queue another attempt.
+            if not success and self._last_hand_status == STATUS_STABLE:
+                self._trigger_pending = True
         finally:
             self._busy = False
 
@@ -161,7 +168,7 @@ class GraspNetNode(Node):
         if len(cloud_masked) < 100:
             self.get_logger().warn(
                 'Too few object points for grasp inference, skipping frame.', throttle_duration_sec=5.0)
-            return
+            return False
 
         if len(cloud_masked) >= self._num_point:
             idxs = np.random.choice(len(cloud_masked), self._num_point, replace=False)
@@ -185,17 +192,48 @@ class GraspNetNode(Node):
             gg = gg[~collision_mask]
 
         gg.nms()
+        if len(gg) > 0:
+            top_score = gg.scores.max()
+            self.get_logger().info(f'Max grasp score before filtering: {top_score:.3f}', throttle_duration_sec=2.0)
+        gg = gg[gg.scores >= self._min_score]
         gg.sort_by_score()  # high to low
         gg = gg[:self._max_grasps]
 
-        if self._publish_debug_image:
-            self._publish_debug(gg, camera, mask, depth, mask_msg.header)
+        out_dir = self.get_parameter('save_debug_inputs_dir').value
+        if out_dir or self._publish_debug_image:
+            canvas = self._create_debug_canvas(gg, camera, mask, depth)
+
+            if self._publish_debug_image:
+                self._publish_debug(canvas, mask_msg.header)
+
+            if out_dir:
+                import os
+                os.makedirs(out_dir, exist_ok=True)
+                timestamp = f"{mask_msg.header.stamp.sec}_{mask_msg.header.stamp.nanosec}"
+                mask_vis = (mask * 127).astype(np.uint8)
+                depth_vis = self._colorize_depth(depth)
+                if self._last_color_bgr is not None and self._last_color_bgr.shape[:2] == mask.shape:
+                    color_vis = self._last_color_bgr
+                else:
+                    color_vis = np.zeros_like(depth_vis)
+                concat = np.hstack([color_vis, cv2.cvtColor(mask_vis, cv2.COLOR_GRAY2BGR), depth_vis, canvas])
+                filepath = os.path.join(out_dir, f"inputs_and_outputs_{timestamp}.jpg")
+                cv2.imwrite(filepath, concat)
+                self.get_logger().info(f"Saved debug images to {filepath}")
 
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
         if len(gg) > 0:
-            # graspnet's rotation_matrix column 0 is the gripper approach direction
-            quats = Rotation.from_matrix(gg.rotation_matrices).as_quat()
+            # GraspNet gives X as approach, Y as binormal.
+            # Franka Hand expects Z as approach, Y as binormal, and -X as orthogonal.
+            # We post-multiply to map the axes to the Franka Hand coordinate frame.
+            T_align = np.array([
+                [ 0.0,  0.0,  1.0],
+                [ 0.0,  1.0,  0.0],
+                [-1.0,  0.0,  0.0]
+            ])
+            aligned_matrices = gg.rotation_matrices @ T_align
+            quats = Rotation.from_matrix(aligned_matrices).as_quat()
             for translation, quat in zip(gg.translations, quats):
                 pose = Pose()
                 pose.position.x, pose.position.y, pose.position.z = translation.tolist()
@@ -206,8 +244,10 @@ class GraspNetNode(Node):
         self.get_logger().info(
             f'GraspNet inference took {time.monotonic() - t0:.3f}s, {len(pose_array.poses)} grasps',
             throttle_duration_sec=5.0)
+            
+        return len(pose_array.poses) > 0
 
-    def _publish_debug(self, gg, camera, mask, depth, header):
+    def _create_debug_canvas(self, gg, camera, mask, depth):
         if self._last_color_bgr is not None and self._last_color_bgr.shape[:2] == mask.shape:
             canvas = self._last_color_bgr.copy()
         else:
@@ -217,7 +257,9 @@ class GraspNetNode(Node):
         canvas[object_px] = (canvas[object_px] * 0.7 + np.array([0, 255, 0]) * 0.3).astype(np.uint8)
 
         self._draw_grasps(canvas, gg, camera)
+        return canvas
 
+    def _publish_debug(self, canvas, header):
         debug_msg = self._bridge.cv2_to_imgmsg(canvas, encoding='bgr8')
         debug_msg.header = header
         self._debug_pub.publish(debug_msg)
