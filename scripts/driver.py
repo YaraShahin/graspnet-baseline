@@ -26,6 +26,7 @@ from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReli
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import String
+import tf2_ros
 
 # scripts/driver.py -> graspnet-baseline, regardless of where the repo is checked out
 GRASPNET_ROOT = Path(__file__).resolve().parent.parent
@@ -101,6 +102,9 @@ class GraspNetNode(Node):
 
         self._bridge = cv_bridge.CvBridge()
         self._busy = False
+        
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -196,12 +200,13 @@ class GraspNetNode(Node):
             top_score = gg.scores.max()
             self.get_logger().info(f'Max grasp score before filtering: {top_score:.3f}', throttle_duration_sec=2.0)
         gg = gg[gg.scores >= self._min_score]
+        
         gg.sort_by_score()  # high to low
         gg = gg[:self._max_grasps]
 
         out_dir = self.get_parameter('save_debug_inputs_dir').value
         if out_dir or self._publish_debug_image:
-            canvas = self._create_debug_canvas(gg, camera, mask, depth)
+            canvas = self._create_debug_canvas(gg[0:50], camera, mask, depth)
 
             if self._publish_debug_image:
                 self._publish_debug(canvas, mask_msg.header)
@@ -221,6 +226,12 @@ class GraspNetNode(Node):
                 cv2.imwrite(filepath, concat)
                 self.get_logger().info(f"Saved debug images to {filepath}")
 
+                if len(gg) > 0:
+                    final_grasp_canvas = self._create_debug_canvas(gg[:1], camera, mask, depth)
+                    final_grasp_filepath = os.path.join(out_dir, f"final_grasp_{timestamp}.jpg")
+                    cv2.imwrite(final_grasp_filepath, final_grasp_canvas)
+                    self.get_logger().info(f"Saved final grasp image to {final_grasp_filepath}")
+
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
         if len(gg) > 0:
@@ -234,7 +245,10 @@ class GraspNetNode(Node):
             ])
             aligned_matrices = gg.rotation_matrices @ T_align
             quats = Rotation.from_matrix(aligned_matrices).as_quat()
-            for translation, quat in zip(gg.translations, quats):
+            
+            new_translations = gg.translations
+            
+            for translation, quat in zip(new_translations, quats):
                 pose = Pose()
                 pose.position.x, pose.position.y, pose.position.z = translation.tolist()
                 pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = quat.tolist()
