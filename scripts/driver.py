@@ -5,6 +5,10 @@ matching CameraInfo (synchronized by header stamp), restricts the depth point
 cloud to the object class (mask == 2), and runs graspnet-baseline to produce
 scored grasp candidates, published as a PoseArray.
 
+Inference is one-shot: it runs only when a capture trigger arrives on
+'capture_trigger' (published by the handover orchestrator), retrying on
+subsequent frames up to 'capture_attempts' times if no valid grasp is found.
+
 Runs inside its own venv (graspnet_venv), isolated from the main ROS workspace
 and from EgoHOS's venv, talking to the rest of the graph only over DDS topics
 -- same isolation pattern as EgoHOS/scripts/driver.py.
@@ -20,12 +24,12 @@ import message_filters
 import numpy as np
 import rclpy
 import torch
-from geometry_msgs.msg import Pose, PoseArray
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import String
+from std_msgs.msg import Empty
 import tf2_ros
 
 # scripts/driver.py -> graspnet-baseline, regardless of where the repo is checked out
@@ -41,11 +45,8 @@ from data_utils import CameraInfo as PointCloudCamera, create_point_cloud_from_d
 CHECKPOINT_DEFAULT = str(GRASPNET_ROOT / 'logs/log_rs/checkpoint.tar')
 
 # EgoHOS combined mask classes (EgoHOS/scripts/driver.py): 0 background, 1 hand, 2 object
+HAND_CLASS_ID = 1
 OBJECT_CLASS_ID = 2
-
-STATUS_NO_HAND = 'no_hand'
-STATUS_UNSTABLE = 'hand_unstable'
-STATUS_STABLE = 'hand_stable'
 
 
 class GraspNetNode(Node):
@@ -60,8 +61,17 @@ class GraspNetNode(Node):
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('debug_image_topic', 'grasp_debug_image')
         self.declare_parameter('publish_debug_image', True)
+        # The pose the grasp selection node picked comes back on this topic;
+        # it is matched to the candidates of the last inference and rendered
+        # as the final-grasp debug image.
+        self.declare_parameter('selected_grasp_topic', 'selected_grasp')
+        self.declare_parameter('selected_debug_image_topic', 'selected_grasp_debug_image')
         self.declare_parameter('debug_approach_length', 0.04)
-        self.declare_parameter('hand_status_topic', 'hand_stability_status')
+        # One inference per trigger message (published by the handover
+        # orchestrator); failed attempts retry on subsequent synced frames
+        # up to capture_attempts before giving up.
+        self.declare_parameter('capture_trigger_topic', 'capture_trigger')
+        self.declare_parameter('capture_attempts', 10)
         self.declare_parameter('checkpoint_path', CHECKPOINT_DEFAULT)
         self.declare_parameter('device', 'cuda:0')
         self.declare_parameter('num_point', 20000)
@@ -69,10 +79,20 @@ class GraspNetNode(Node):
         self.declare_parameter('voxel_size', 0.01)
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('max_grasps', 50)
-        self.declare_parameter('min_score', 0.2)
+        self.declare_parameter('min_score', 0.25)
+        # Object points within this pixel radius of the hand are excluded from the
+        # cloud fed to GraspNet, so no candidates are seeded next to the fingers
+        # (the finger-occlusion edges otherwise look like ideal grasp geometry).
+        # The collision cloud keeps the full hand, so this only moves candidates
+        # away from the hand -- it doesn't weaken collision checking.
+        self.declare_parameter('hand_exclusion_px', 20)
         # realsense aligned-depth is 16UC1 millimetres; this converts raw depth to metres
         self.declare_parameter('depth_scale', 1000.0)
         self.declare_parameter('sync_slop', 0.05)
+        # The mask arrives one full EgoHOS inference after its stamp, so the
+        # synchronizer must buffer at least camera_rate * EgoHOS_latency depth
+        # frames or the matching depth is evicted before the mask shows up.
+        self.declare_parameter('sync_queue_size', 150)
         self.declare_parameter('save_debug_inputs_dir', '/tmp/graspnet_inputs')
 
         device_name = self.get_parameter('device').value
@@ -82,12 +102,18 @@ class GraspNetNode(Node):
         self._collision_thresh = self.get_parameter('collision_thresh').value
         self._max_grasps = self.get_parameter('max_grasps').value
         self._min_score = self.get_parameter('min_score').value
+        exclusion_px = self.get_parameter('hand_exclusion_px').value
+        self._hand_exclusion_kernel = None
+        if exclusion_px > 0:
+            self._hand_exclusion_kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (2 * exclusion_px + 1, 2 * exclusion_px + 1))
         self._depth_scale = self.get_parameter('depth_scale').value
         self._publish_debug_image = self.get_parameter('publish_debug_image').value
         self._debug_approach_length = self.get_parameter('debug_approach_length').value
         self._last_color_bgr = None
-        self._last_hand_status = None
         self._trigger_pending = False
+        self._attempts_left = 0
+        self._capture_attempts = self.get_parameter('capture_attempts').value
 
         self.get_logger().info(f'Loading GraspNet on {self._device}...')
         self._net = GraspNet(
@@ -119,14 +145,22 @@ class GraspNetNode(Node):
         info_sub = message_filters.Subscriber(
             self, CameraInfo, self.get_parameter('camera_info_topic').value, qos_profile=sensor_qos)
         self._sync = message_filters.ApproximateTimeSynchronizer(
-            [mask_sub, depth_sub, info_sub], queue_size=30,
+            [mask_sub, depth_sub, info_sub],
+            queue_size=self.get_parameter('sync_queue_size').value,
             slop=self.get_parameter('sync_slop').value)
         self._sync.registerCallback(self._on_synced)
 
         self.create_subscription(
-            String, self.get_parameter('hand_status_topic').value, self._on_hand_status, 10)
+            Empty, self.get_parameter('capture_trigger_topic').value, self._on_capture_trigger, 10)
 
         self._grasp_pub = self.create_publisher(PoseArray, self.get_parameter('grasp_topic').value, 1)
+
+        self._last_inference = None
+        self.create_subscription(
+            PoseStamped, self.get_parameter('selected_grasp_topic').value,
+            self._on_selected_grasp, 10)
+        self._selected_debug_pub = self.create_publisher(
+            Image, self.get_parameter('selected_debug_image_topic').value, 1)
 
         if self._publish_debug_image:
             self.create_subscription(
@@ -137,10 +171,10 @@ class GraspNetNode(Node):
     def _on_color(self, msg: Image):
         self._last_color_bgr = self._bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
 
-    def _on_hand_status(self, msg: String):
-        if msg.data == STATUS_STABLE and self._last_hand_status != STATUS_STABLE:
-            self._trigger_pending = True
-        self._last_hand_status = msg.data
+    def _on_capture_trigger(self, _msg: Empty):
+        self.get_logger().info('Capture trigger received.')
+        self._trigger_pending = True
+        self._attempts_left = self._capture_attempts
 
     def _on_synced(self, mask_msg: Image, depth_msg: Image, info_msg: CameraInfo):
         if self._busy or not self._trigger_pending:
@@ -149,10 +183,16 @@ class GraspNetNode(Node):
         self._trigger_pending = False
         try:
             success = self._process(mask_msg, depth_msg, info_msg)
-            # If inference found no valid grasps (e.g. bad depth, collisions, or missing segmentation)
-            # but the hand is still stable, queue another attempt.
-            if not success and self._last_hand_status == STATUS_STABLE:
-                self._trigger_pending = True
+            # If inference found no valid grasps (e.g. bad depth, collisions, or
+            # missing segmentation), retry on the next synced frame until the
+            # attempt budget for this trigger is used up.
+            if not success:
+                self._attempts_left -= 1
+                if self._attempts_left > 0:
+                    self._trigger_pending = True
+                else:
+                    self.get_logger().warn(
+                        'No valid grasps after all capture attempts — giving up until next trigger.')
         finally:
             self._busy = False
 
@@ -167,7 +207,13 @@ class GraspNetNode(Node):
             self._depth_scale)
         cloud = create_point_cloud_from_depth_image(depth, camera, organized=True)
 
-        valid = (mask == OBJECT_CLASS_ID) & (depth > 0)
+        object_mask = mask == OBJECT_CLASS_ID
+        if self._hand_exclusion_kernel is not None:
+            hand_mask = (mask == HAND_CLASS_ID).astype(np.uint8)
+            if hand_mask.any():
+                object_mask &= cv2.dilate(hand_mask, self._hand_exclusion_kernel) == 0
+
+        valid = object_mask & (depth > 0)
         cloud_masked = cloud[valid]
         if len(cloud_masked) < 100:
             self.get_logger().warn(
@@ -189,18 +235,27 @@ class GraspNetNode(Node):
             grasp_preds = pred_decode(end_points)
         gg = GraspGroup(grasp_preds[0].detach().cpu().numpy())
 
+        n_decoded = len(gg)
         if self._collision_thresh > 0:
-            detector = ModelFreeCollisionDetector(cloud_masked, voxel_size=self._voxel_size)
+            # Collision-check against hand + object points (not just the object) so
+            # grasps whose gripper volume sweeps through the human hand are rejected.
+            collision_cloud = cloud[(mask > 0) & (depth > 0)]
+            detector = ModelFreeCollisionDetector(collision_cloud, voxel_size=self._voxel_size)
             collision_mask = detector.detect(
                 gg, approach_dist=0.05, collision_thresh=self._collision_thresh)
             gg = gg[~collision_mask]
+        n_collision_free = len(gg)
 
         gg.nms()
-        if len(gg) > 0:
-            top_score = gg.scores.max()
-            self.get_logger().info(f'Max grasp score before filtering: {top_score:.3f}', throttle_duration_sec=2.0)
+        top_score = gg.scores.max() if len(gg) > 0 else float('nan')
         gg = gg[gg.scores >= self._min_score]
-        
+
+        # Funnel log: shows at which stage candidates die when nothing survives.
+        self.get_logger().info(
+            f'Grasps: {n_decoded} decoded -> {n_collision_free} collision-free -> '
+            f'top score {top_score:.2f} after NMS -> {len(gg)} above min_score={self._min_score}, '
+            f'object points {len(cloud_masked)}')
+
         gg.sort_by_score()  # high to low
         gg = gg[:self._max_grasps]
 
@@ -226,12 +281,6 @@ class GraspNetNode(Node):
                 cv2.imwrite(filepath, concat)
                 self.get_logger().info(f"Saved debug images to {filepath}")
 
-                if len(gg) > 0:
-                    final_grasp_canvas = self._create_debug_canvas(gg[:1], camera, mask, depth)
-                    final_grasp_filepath = os.path.join(out_dir, f"final_grasp_{timestamp}.jpg")
-                    cv2.imwrite(final_grasp_filepath, final_grasp_canvas)
-                    self.get_logger().info(f"Saved final grasp image to {final_grasp_filepath}")
-
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
         if len(gg) > 0:
@@ -254,12 +303,49 @@ class GraspNetNode(Node):
                 pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = quat.tolist()
                 pose_array.poses.append(pose)
         self._grasp_pub.publish(pose_array)
+        if len(gg) > 0:
+            # Kept so the final-grasp debug image can be rendered once the
+            # selection node reports back which candidate it picked.
+            self._last_inference = (gg, camera, mask, depth, mask_msg.header)
 
         self.get_logger().info(
             f'GraspNet inference took {time.monotonic() - t0:.3f}s, {len(pose_array.poses)} grasps',
             throttle_duration_sec=5.0)
-            
+
         return len(pose_array.poses) > 0
+
+    def _on_selected_grasp(self, msg: PoseStamped):
+        """Render the candidate the selection node picked as the final-grasp
+        debug image (published and, if save_debug_inputs_dir is set, saved).
+
+        The selection node republishes the pose values unchanged, so the
+        candidate is recovered by nearest-position match against the last
+        inference.
+        """
+        if self._last_inference is None:
+            return
+        gg, camera, mask, depth, header = self._last_inference
+        p = msg.pose.position
+        dists = np.linalg.norm(
+            gg.translations - np.array([p.x, p.y, p.z]), axis=1)
+        idx = int(dists.argmin())
+        if dists[idx] > 0.005:
+            self.get_logger().warn(
+                f'Selected grasp is {dists[idx]:.3f} m from the nearest candidate '
+                'of the last inference — rendering the nearest one anyway.')
+        canvas = self._create_debug_canvas(gg[idx:idx + 1], camera, mask, depth)
+        img_msg = self._bridge.cv2_to_imgmsg(canvas, encoding='bgr8')
+        img_msg.header = header
+        self._selected_debug_pub.publish(img_msg)
+
+        out_dir = self.get_parameter('save_debug_inputs_dir').value
+        if out_dir:
+            import os
+            os.makedirs(out_dir, exist_ok=True)
+            timestamp = f"{header.stamp.sec}_{header.stamp.nanosec}"
+            filepath = os.path.join(out_dir, f'final_grasp_{timestamp}.jpg')
+            cv2.imwrite(filepath, canvas)
+            self.get_logger().info(f'Saved selected-grasp image to {filepath}')
 
     def _create_debug_canvas(self, gg, camera, mask, depth):
         if self._last_color_bgr is not None and self._last_color_bgr.shape[:2] == mask.shape:
