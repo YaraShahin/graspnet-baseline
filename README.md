@@ -128,5 +128,99 @@ Please cite our paper in your publications if it helps your research:
 }
 ```
 
-## License
-All data, labels, code and models belong to the graspnet team, MVIG, SJTU and are freely available for free non-commercial use, and may be redistributed under these conditions. For commercial queries, please drop an email at fhaoshu at gmail_dot_com and cc lucewu at sjtu.edu.cn .
+# TODO
+
+1. Statically validate the grasp position before the arm ever moves (blocker). We removed the empirical +0.09 Y offset with nothing replacing it, and the mirror correction moved from code into TF. Both need one ground-truth check: hold an object at a spot you can measure relative to the robot base (tape measure to panda_link0 origin), trigger inference, and compare ros2 topic echo /selected_grasp (after the orchestrator's transform — or add a Pose display in RViz with fixed frame panda_link0) against reality. If it's off by a consistent ~9 cm in one axis, that's the residual calibration error the old offset was masking — recalibrate before any motion. Five minutes of checking versus a 9 cm miss next to someone's hand.
+---
+
+# H2R Handover Pipeline — Usage
+
+Full command reference for running the hand-to-robot handover pipeline
+(RealSense D435 → EgoHOS segmentation → GraspNet → grasp selection →
+MoveIt / Franka execution).
+
+The `handover_orchestrator` is the single operator console — per handover
+you press **Enter once to capture** a grasp and then **Enter to confirm each
+planned motion**. It reads keyboard input, so it **must** run in its own
+terminal — `ros2 launch` does not forward stdin. The two perception drivers
+run inside their own venvs and also get their own terminals.
+
+## One-time / after changing h2r_handovers
+
+```bash
+cd ~/projects/handovers_ws/handover_ws
+colcon build --packages-select h2r_handovers
+```
+
+(The EgoHOS and GraspNet drivers run straight from source — no build needed,
+just restart them.)
+
+## Terminal 1 — camera, MoveIt + RViz, static TFs, grasp selection
+
+```bash
+source ~/projects/handovers_ws/handover_ws/install/setup.bash
+ros2 launch h2r_handovers handover.launch.xml
+```
+
+## Terminal 2 — EgoHOS segmentation driver (egohos_venv)
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/projects/handovers_ws/src/egohos_venv/bin/activate
+python ~/projects/handovers_ws/src/EgoHOS/scripts/driver.py
+```
+
+## Terminal 3 — GraspNet driver (graspnet_venv)
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/projects/handovers_ws/src/graspnet_venv/bin/activate
+python ~/projects/handovers_ws/src/graspnet-baseline/scripts/driver.py
+```
+
+## Terminal 4 — handover orchestrator (operator console)
+
+```bash
+ros2 run h2r_handovers handover_orchestrator --ros-args \
+  --params-file ~/projects/handovers_ws/handover_ws/src/h2r_handovers/config/handover_params.yaml
+```
+
+This terminal drives the whole handover:
+
+- When the state is `IDLE`, it prompts `press Enter to capture a grasp` —
+  hold the object steady in view and press **Enter**. This publishes the
+  capture trigger that makes the GraspNet driver run inference.
+- With `confirm_before_execute: true` (default), every arm motion is then
+  planned first; inspect the trajectory in RViz (Planned Path display) and
+  press **Enter** to execute it, or `n` + Enter to abort the handover.
+- With `require_stable_hand: true` (and `hand_stabilization_node` running,
+  currently commented out in the launch file), an armed capture waits for
+  the `hand_stable` status before triggering.
+
+## Typical test sequence
+
+1. Start terminals 1–4; wait for "EgoHOS models loaded" and "GraspNet
+   loaded" in terminals 2–3, and confirm the startup homing in terminal 4.
+2. Hold the object in view of the camera, press Enter in terminal 4 at the
+   `IDLE` prompt.
+3. Watch `grasp_debug_image` (e.g. in rqt or RViz) — grasp candidates drawn
+   over the object.
+4. Still in terminal 4: pre-grasp is planned → check RViz → Enter → final
+   approach is planned → check → Enter → gripper closes → release the object
+   → confirm the remaining motions (retreat, dropoff, return home).
+5. Back at `IDLE`, press Enter for the next handover.
+
+## Useful debug topics
+
+| Topic                    | Content                                        |
+|--------------------------|------------------------------------------------|
+| `system_state`           | Orchestrator state machine (latched), incl. the |
+|                          | `WAITING_FOR_HAND` / `CAPTURING` phases        |
+| `segmentation_overlay`   | EgoHOS hand/object mask over the RGB image     |
+| `grasp_debug_image`      | GraspNet candidates drawn on the image         |
+| `grasp_candidates`       | PoseArray of scored grasps (camera frame)      |
+| `selected_grasp`         | PoseStamped chosen by the selection policy     |
+| `capture_trigger`        | Empty msg, orchestrator → GraspNet driver      |
+| `hand_stability_status`  | `no_hand` / `hand_unstable` / `hand_stable`    |
+
+Saved debug frames (inputs + candidates) land in `/tmp/graspnet_inputs/`.

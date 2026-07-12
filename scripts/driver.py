@@ -24,7 +24,7 @@ import message_filters
 import numpy as np
 import rclpy
 import torch
-from geometry_msgs.msg import Pose, PoseArray, PoseStamped
+from geometry_msgs.msg import Pose, PoseArray, PoseStamped, PointStamped
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from scipy.spatial.transform import Rotation
@@ -154,6 +154,12 @@ class GraspNetNode(Node):
             Empty, self.get_parameter('capture_trigger_topic').value, self._on_capture_trigger, 10)
 
         self._grasp_pub = self.create_publisher(PoseArray, self.get_parameter('grasp_topic').value, 1)
+        # 3-D centroid of the hand pixels for each inference, published just
+        # before the candidates (same header stamp, same camera frame) so the
+        # selection node's ergonomic policy can score hand clearance.
+        self.declare_parameter('hand_center_topic', 'hand_center')
+        self._hand_center_pub = self.create_publisher(
+            PointStamped, self.get_parameter('hand_center_topic').value, 1)
 
         self._last_inference = None
         self.create_subscription(
@@ -281,6 +287,17 @@ class GraspNetNode(Node):
                 cv2.imwrite(filepath, concat)
                 self.get_logger().info(f"Saved debug images to {filepath}")
 
+        # Hand centroid for the ergonomic policy — published before the
+        # candidates so it is already cached when they arrive. No message when
+        # the hand isn't visible; the selection node detects that by stamp.
+        hand_valid = (mask == HAND_CLASS_ID) & (depth > 0)
+        if hand_valid.any():
+            hand_center = cloud[hand_valid].mean(axis=0)
+            hand_msg = PointStamped()
+            hand_msg.header = mask_msg.header
+            hand_msg.point.x, hand_msg.point.y, hand_msg.point.z = hand_center.tolist()
+            self._hand_center_pub.publish(hand_msg)
+
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
         if len(gg) > 0:
@@ -333,6 +350,10 @@ class GraspNetNode(Node):
             self.get_logger().warn(
                 f'Selected grasp is {dists[idx]:.3f} m from the nearest candidate '
                 'of the last inference — rendering the nearest one anyway.')
+        self.get_logger().info(
+            f'Selected grasp: candidate index {idx} of {len(gg)}, '
+            f'GraspNet confidence score {gg.scores[idx]:.3f} '
+            f'(top score this inference: {gg.scores.max():.3f}).')
         canvas = self._create_debug_canvas(gg[idx:idx + 1], camera, mask, depth)
         img_msg = self._bridge.cv2_to_imgmsg(canvas, encoding='bgr8')
         img_msg.header = header
