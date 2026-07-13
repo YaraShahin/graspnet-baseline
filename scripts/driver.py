@@ -1,18 +1,4 @@
-"""GraspNet grasp-candidate node.
-
-Subscribes to the EgoHOS segmentation mask, the aligned depth image, and the
-matching CameraInfo (synchronized by header stamp), restricts the depth point
-cloud to the object class (mask == 2), and runs graspnet-baseline to produce
-scored grasp candidates, published as a PoseArray.
-
-Inference is one-shot: it runs only when a capture trigger arrives on
-'capture_trigger' (published by the handover orchestrator), retrying on
-subsequent frames up to 'capture_attempts' times if no valid grasp is found.
-
-Runs inside its own venv (graspnet_venv), isolated from the main ROS workspace
-and from EgoHOS's venv, talking to the rest of the graph only over DDS topics
--- same isolation pattern as EgoHOS/scripts/driver.py.
-"""
+"""GraspNet grasp-candidate node."""
 
 import sys
 import time
@@ -24,15 +10,15 @@ import message_filters
 import numpy as np
 import rclpy
 import torch
+import tf2_ros
 from geometry_msgs.msg import Pose, PoseArray, PoseStamped, PointStamped
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Empty
-import tf2_ros
 
-# scripts/driver.py -> graspnet-baseline, regardless of where the repo is checked out
+# Default path to the graspnet-baseline library
 GRASPNET_ROOT = Path(__file__).resolve().parent.parent
 for _sub in ('models', 'dataset', 'utils'):
     sys.path.append(str(GRASPNET_ROOT / _sub))
@@ -44,7 +30,7 @@ from data_utils import CameraInfo as PointCloudCamera, create_point_cloud_from_d
 
 CHECKPOINT_DEFAULT = str(GRASPNET_ROOT / 'logs/log_rs/checkpoint.tar')
 
-# EgoHOS combined mask classes (EgoHOS/scripts/driver.py): 0 background, 1 hand, 2 object
+# Mask classes definition
 HAND_CLASS_ID = 1
 OBJECT_CLASS_ID = 2
 
@@ -61,15 +47,13 @@ class GraspNetNode(Node):
         self.declare_parameter('color_topic', '/camera/camera/color/image_raw')
         self.declare_parameter('debug_image_topic', 'grasp_debug_image')
         self.declare_parameter('publish_debug_image', True)
-        # The pose the grasp selection node picked comes back on this topic;
-        # it is matched to the candidates of the last inference and rendered
-        # as the final-grasp debug image.
+        
+        # Topic for the final selected grasp to render debug overlays
         self.declare_parameter('selected_grasp_topic', 'selected_grasp')
         self.declare_parameter('selected_debug_image_topic', 'selected_grasp_debug_image')
         self.declare_parameter('debug_approach_length', 0.04)
-        # One inference per trigger message (published by the handover
-        # orchestrator); failed attempts retry on subsequent synced frames
-        # up to capture_attempts before giving up.
+        
+        # Trigger topic for one-shot inference, with retry attempts on failure
         self.declare_parameter('capture_trigger_topic', 'capture_trigger')
         self.declare_parameter('capture_attempts', 10)
         self.declare_parameter('checkpoint_path', CHECKPOINT_DEFAULT)
@@ -80,18 +64,15 @@ class GraspNetNode(Node):
         self.declare_parameter('collision_thresh', 0.01)
         self.declare_parameter('max_grasps', 50)
         self.declare_parameter('min_score', 0.25)
-        # Object points within this pixel radius of the hand are excluded from the
-        # cloud fed to GraspNet, so no candidates are seeded next to the fingers
-        # (the finger-occlusion edges otherwise look like ideal grasp geometry).
-        # The collision cloud keeps the full hand, so this only moves candidates
-        # away from the hand -- it doesn't weaken collision checking.
+        
+        # Radius (px) to exclude object points near the hand from grasp seeding
         self.declare_parameter('hand_exclusion_px', 20)
-        # realsense aligned-depth is 16UC1 millimetres; this converts raw depth to metres
+        
+        # Depth scale factor to convert raw depth to meters
         self.declare_parameter('depth_scale', 1000.0)
         self.declare_parameter('sync_slop', 0.05)
-        # The mask arrives one full EgoHOS inference after its stamp, so the
-        # synchronizer must buffer at least camera_rate * EgoHOS_latency depth
-        # frames or the matching depth is evicted before the mask shows up.
+        
+        # Buffer size to handle EgoHOS latency and synchronize matching frames
         self.declare_parameter('sync_queue_size', 150)
         self.declare_parameter('save_debug_inputs_dir', '/tmp/graspnet_inputs')
 
@@ -127,6 +108,8 @@ class GraspNetNode(Node):
         self.get_logger().info(f"GraspNet loaded (epoch {checkpoint['epoch']}).")
 
         self._bridge = cv_bridge.CvBridge()
+        
+        # Busy flag is used to drop frames if the pipeline is still processing the previous one
         self._busy = False
         
         self._tf_buffer = tf2_ros.Buffer()
@@ -154,9 +137,8 @@ class GraspNetNode(Node):
             Empty, self.get_parameter('capture_trigger_topic').value, self._on_capture_trigger, 10)
 
         self._grasp_pub = self.create_publisher(PoseArray, self.get_parameter('grasp_topic').value, 1)
-        # 3-D centroid of the hand pixels for each inference, published just
-        # before the candidates (same header stamp, same camera frame) so the
-        # selection node's ergonomic policy can score hand clearance.
+        
+        # Hand centroid topic, used by selection node to score ergonomic clearance
         self.declare_parameter('hand_center_topic', 'hand_center')
         self._hand_center_pub = self.create_publisher(
             PointStamped, self.get_parameter('hand_center_topic').value, 1)
@@ -189,9 +171,7 @@ class GraspNetNode(Node):
         self._trigger_pending = False
         try:
             success = self._process(mask_msg, depth_msg, info_msg)
-            # If inference found no valid grasps (e.g. bad depth, collisions, or
-            # missing segmentation), retry on the next synced frame until the
-            # attempt budget for this trigger is used up.
+            # Retry on the next synced frame if no valid grasps are found
             if not success:
                 self._attempts_left -= 1
                 if self._attempts_left > 0:
@@ -207,6 +187,7 @@ class GraspNetNode(Node):
         mask = self._bridge.imgmsg_to_cv2(mask_msg, desired_encoding='mono8')
         depth = self._bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough').astype(np.float32)
 
+        # Extract camera intrinsics (fx, fy, cx, cy) from camera_info message array
         camera = PointCloudCamera(
             info_msg.width, info_msg.height,
             info_msg.k[0], info_msg.k[4], info_msg.k[2], info_msg.k[5],
@@ -226,6 +207,8 @@ class GraspNetNode(Node):
                 'Too few object points for grasp inference, skipping frame.', throttle_duration_sec=5.0)
             return False
 
+        # GraspNet requires exactly 'num_point' input points. 
+        # Randomly downsample if we have too many, or oversample (with replacement) if too few.
         if len(cloud_masked) >= self._num_point:
             idxs = np.random.choice(len(cloud_masked), self._num_point, replace=False)
         else:
@@ -243,8 +226,7 @@ class GraspNetNode(Node):
 
         n_decoded = len(gg)
         if self._collision_thresh > 0:
-            # Collision-check against hand + object points (not just the object) so
-            # grasps whose gripper volume sweeps through the human hand are rejected.
+            # Collision-check against both hand and object to avoid human contact
             collision_cloud = cloud[(mask > 0) & (depth > 0)]
             detector = ModelFreeCollisionDetector(collision_cloud, voxel_size=self._voxel_size)
             collision_mask = detector.detect(
@@ -256,13 +238,13 @@ class GraspNetNode(Node):
         top_score = gg.scores.max() if len(gg) > 0 else float('nan')
         gg = gg[gg.scores >= self._min_score]
 
-        # Funnel log: shows at which stage candidates die when nothing survives.
+        # Log grasp survival funnel through collision checking and NMS
         self.get_logger().info(
             f'Grasps: {n_decoded} decoded -> {n_collision_free} collision-free -> '
             f'top score {top_score:.2f} after NMS -> {len(gg)} above min_score={self._min_score}, '
             f'object points {len(cloud_masked)}')
 
-        gg.sort_by_score()  # high to low
+        gg.sort_by_score()
         gg = gg[:self._max_grasps]
 
         out_dir = self.get_parameter('save_debug_inputs_dir').value
@@ -287,9 +269,7 @@ class GraspNetNode(Node):
                 cv2.imwrite(filepath, concat)
                 self.get_logger().info(f"Saved debug images to {filepath}")
 
-        # Hand centroid for the ergonomic policy — published before the
-        # candidates so it is already cached when they arrive. No message when
-        # the hand isn't visible; the selection node detects that by stamp.
+        # Compute and publish hand centroid if visible
         hand_valid = (mask == HAND_CLASS_ID) & (depth > 0)
         if hand_valid.any():
             hand_center = cloud[hand_valid].mean(axis=0)
@@ -301,9 +281,8 @@ class GraspNetNode(Node):
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
         if len(gg) > 0:
-            # GraspNet gives X as approach, Y as binormal.
-            # Franka Hand expects Z as approach, Y as binormal, and -X as orthogonal.
-            # We post-multiply to map the axes to the Franka Hand coordinate frame.
+            # Map GraspNet axes (X: approach, Y: binormal) to Franka Hand frame
+            # (Z: approach, Y: binormal, -X: orthogonal)
             T_align = np.array([
                 [ 0.0,  0.0,  1.0],
                 [ 0.0,  1.0,  0.0],
@@ -320,9 +299,9 @@ class GraspNetNode(Node):
                 pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w = quat.tolist()
                 pose_array.poses.append(pose)
         self._grasp_pub.publish(pose_array)
+        
         if len(gg) > 0:
-            # Kept so the final-grasp debug image can be rendered once the
-            # selection node reports back which candidate it picked.
+            # Cache inference state to render final selected grasp debug image
             self._last_inference = (gg, camera, mask, depth, mask_msg.header)
 
         self.get_logger().info(
@@ -332,13 +311,7 @@ class GraspNetNode(Node):
         return len(pose_array.poses) > 0
 
     def _on_selected_grasp(self, msg: PoseStamped):
-        """Render the candidate the selection node picked as the final-grasp
-        debug image (published and, if save_debug_inputs_dir is set, saved).
-
-        The selection node republishes the pose values unchanged, so the
-        candidate is recovered by nearest-position match against the last
-        inference.
-        """
+        """Match selected grasp pose to cached inference candidates and render debug image."""
         if self._last_inference is None:
             return
         gg, camera, mask, depth, header = self._last_inference
@@ -404,14 +377,20 @@ class GraspNetNode(Node):
             approach = gg.rotation_matrices[i][:, 0]  # gripper approach axis
             binormal = gg.rotation_matrices[i][:, 1]  # finger separation axis
             half_width = gg.widths[i] / 2.0
+            
+            # Define grasp geometry keypoints in 3D: base, tip, left finger, right finger
             points_3d = np.stack([
                 center,
                 center + approach * self._debug_approach_length,
                 center - binormal * half_width,
                 center + binormal * half_width,
             ])
+            
+            # Skip drawing if any point is behind the camera plane (Z <= 0)
             if (points_3d[:, 2] <= 0).any():
                 continue
+                
+            # Pinhole camera projection: map 3D points (X,Y,Z) to 2D image plane (u,v)
             u = camera.fx * points_3d[:, 0] / points_3d[:, 2] + camera.cx
             v = camera.fy * points_3d[:, 1] / points_3d[:, 2] + camera.cy
             base, tip, left, right = (
@@ -423,7 +402,7 @@ class GraspNetNode(Node):
 
     @staticmethod
     def _score_color(score_norm):
-        # BGR, red (low score) -> green (high score)
+        # BGR, red (low score), green (high score)
         return (0, int(255 * score_norm), int(255 * (1 - score_norm)))
 
 
