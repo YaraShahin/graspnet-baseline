@@ -16,7 +16,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from scipy.spatial.transform import Rotation
 from sensor_msgs.msg import CameraInfo, Image
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, Float32
 
 # Default path to the graspnet-baseline library
 GRASPNET_ROOT = Path(__file__).resolve().parent.parent
@@ -51,6 +51,7 @@ class GraspNetNode(Node):
         # Topic for the final selected grasp to render debug overlays
         self.declare_parameter('selected_grasp_topic', 'selected_grasp')
         self.declare_parameter('selected_debug_image_topic', 'selected_grasp_debug_image')
+        self.declare_parameter('selected_grasp_score_topic', 'selected_grasp_score')
         self.declare_parameter('debug_approach_length', 0.04)
         
         # Trigger topic for one-shot inference, with retry attempts on failure
@@ -154,6 +155,8 @@ class GraspNetNode(Node):
             self._on_selected_grasp, 10)
         self._selected_debug_pub = self.create_publisher(
             Image, self.get_parameter('selected_debug_image_topic').value, 1)
+        self._selected_score_pub = self.create_publisher(
+            Float32, self.get_parameter('selected_grasp_score_topic').value, 1)
 
         if self._publish_debug_image:
             self.create_subscription(
@@ -355,7 +358,18 @@ class GraspNetNode(Node):
             f'Selected grasp: candidate index {idx} of {len(gg)}, '
             f'GraspNet confidence score {gg.scores[idx]:.3f} '
             f'(top score this inference: {gg.scores.max():.3f}).')
+            
+        score_msg = Float32()
+        score_msg.data = float(gg.scores[idx])
+        self._selected_score_pub.publish(score_msg)
+
         canvas = self._create_debug_canvas(gg[idx:idx + 1], camera, mask, depth)
+        
+        # Add score text to the debug image
+        score_text = f"Score: {gg.scores[idx]:.3f} (Rank: {idx + 1}/{len(gg)})"
+        cv2.putText(canvas, score_text, (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                    1.0, (255, 255, 255), 2, cv2.LINE_AA)
+                    
         img_msg = self._bridge.cv2_to_imgmsg(canvas, encoding='bgr8')
         img_msg.header = header
         self._selected_debug_pub.publish(img_msg)
