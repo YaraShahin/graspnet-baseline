@@ -70,6 +70,10 @@ class GraspNetNode(Node):
         
         # Depth scale factor to convert raw depth to meters
         self.declare_parameter('depth_scale', 1000.0)
+        # Depth outlier filter: remove object points whose depth deviates by
+        # more than N sigma-equivalents (MAD-based) from the median.
+        # Set to 0 to disable.
+        self.declare_parameter('depth_outlier_sigma', 2.5)
         self.declare_parameter('sync_slop', 0.05)
         
         # Buffer size to handle EgoHOS latency and synchronize matching frames
@@ -89,6 +93,7 @@ class GraspNetNode(Node):
             self._hand_exclusion_kernel = cv2.getStructuringElement(
                 cv2.MORPH_ELLIPSE, (2 * exclusion_px + 1, 2 * exclusion_px + 1))
         self._depth_scale = self.get_parameter('depth_scale').value
+        self._depth_outlier_sigma = self.get_parameter('depth_outlier_sigma').value
         self._publish_debug_image = self.get_parameter('publish_debug_image').value
         self._debug_approach_length = self.get_parameter('debug_approach_length').value
         self._last_color_bgr = None
@@ -202,6 +207,26 @@ class GraspNetNode(Node):
 
         valid = object_mask & (depth > 0)
         cloud_masked = cloud[valid]
+
+        # Remove depth outlier points (multipath, edge bleed, temporal spikes)
+        # using MAD-based filtering on the camera-frame Z axis.
+        if self._depth_outlier_sigma > 0 and len(cloud_masked) > 10:
+            z_vals = cloud_masked[:, 2]
+            z_median = np.median(z_vals)
+            mad = np.median(np.abs(z_vals - z_median))
+            # 1.4826 converts MAD to standard-deviation equivalent for normal data
+            sigma_equiv = max(1.4826 * mad, 0.005)  # 5 mm floor for thin objects
+            z_lo = z_median - self._depth_outlier_sigma * sigma_equiv
+            z_hi = z_median + self._depth_outlier_sigma * sigma_equiv
+            inlier = (z_vals >= z_lo) & (z_vals <= z_hi)
+            n_outliers = int((~inlier).sum())
+            if n_outliers > 0:
+                self.get_logger().info(
+                    f'Depth outlier filter: removed {n_outliers}/{len(z_vals)} '
+                    f'points outside [{z_lo:.3f}, {z_hi:.3f}] m '
+                    f'(median {z_median:.3f}, MAD {mad:.4f})')
+            cloud_masked = cloud_masked[inlier]
+
         if len(cloud_masked) < 100:
             self.get_logger().warn(
                 'Too few object points for grasp inference, skipping frame.', throttle_duration_sec=5.0)
@@ -280,6 +305,9 @@ class GraspNetNode(Node):
 
         pose_array = PoseArray()
         pose_array.header = mask_msg.header
+        # EgoHOS segmentation returns color optical frame. The 180 Z-flip is handled 
+        # statically in the TF tree via camera_color_optical_corrected.
+        pose_array.header.frame_id = 'camera_color_optical_corrected'
         if len(gg) > 0:
             # Map GraspNet axes (X: approach, Y: binormal) to Franka Hand frame
             # (Z: approach, Y: binormal, -X: orthogonal)
